@@ -3,9 +3,8 @@
 # Driver adapted by Saffron Murcia (2020) for
 # DF Robot weather station kit with Anemometer/Wind Vane/Rain Bucket
 # All credit for original driver goes to Matthew Wall and other mentions below.
-# Matthew Wall GitHub: https://github.com/matthewwall
 
-# Development Level: Very, VERY ALPHA
+# Development Level: ALPHA
 
 # Changes
 # 0.02 - adapted parser to work with new data format
@@ -13,14 +12,12 @@
 # 0.02.2 - changed multipliers to work with data from station
 # 0.02.3 - Corrections to multipliers
 # 0.03 - intruduced checksum error detection
-#           weather station tends to corrupt data in high rain conditions (December 2021)
+#           weather station tends to corrupt data in high rain conditions
 # 0.03.1 - driver tends to drop a clanger on syslog. Incorporated try/except in to logging. To monitor.
-# 0.03.2 - Updated some comments prior to uploading to github.
-
-# Future updates:
-# - Remove references to TCP comm stack as not used by DFRobot
-# - Rework parsing with common formulae
-# - 
+# 0.03.2 - added try-except function around each packet section to increase robustness of driver. XOR
+#          checksum provided by driver will not detect transposed values.
+# 0.04 - (Linux) functionality added so if /tmp/dfdebug exists, log the packet received to syslog
+# 0.05 - Added function to smooth with direction data from low-res windvane. NONE-COMPLIANT OPTION. See documentation
 
 """
 #
@@ -40,14 +37,47 @@ Thanks to Jay Nugent (WB8TKL) and KRK6 for weather-2.kr6k-V2.1
 from __future__ import with_statement
 import syslog
 import time
+from os.path import exists
+from math import sin, cos, atan2
 
 from weewx.units import INHG_PER_MBAR, MILE_PER_KM
 import weewx.drivers
 import weewx.wxformulas
 
 DRIVER_NAME = 'dfrobot'
-DRIVER_VERSION = '0.03.2'
+DRIVER_VERSION = '0.05'
 
+# Functions to deal with low-res windvane hardware.
+# This section goes against the WeeWX guidelines for
+# the functionality of a drive. Use with caution.
+
+LOW_RES_VANE = True # Set to True for 4 point vane
+
+direction=[]
+sampleSize = 30 #how many direction values to use as the sample
+def degreesToRadians(degrees):
+    return(degrees*(3.14159/180))
+def radiansToDegrees(radians):
+    degrees=(radians*(180/3.14159))
+    if degrees<0:
+        degrees=360+degrees
+    return(degrees)
+
+def averageDir(directionDeg):
+    if len(direction)>sampleSize:
+        direction.pop(0)
+    direction.append(directionDeg)
+    for each in direction:
+        try:
+            ew_vector += sin(degreesToRadians(each))
+            ns_vector += cos(degreesToRadians(each))
+        except:
+            ew_vector = sin(degreesToRadians(each))
+            ns_vector = cos(degreesToRadians(each))
+    ew_average = ew_vector/len(direction)
+    ns_average = ns_vector/len(direction)
+    return(int(round(radiansToDegrees(atan2(ew_average,ns_average)),0)))
+# End Direction smoothing functions
 
 def loader(config_dict, _):
     return dfrobotDriver(**config_dict[DRIVER_NAME])
@@ -172,7 +202,10 @@ class StationData(object):
     @staticmethod
     def validate_string(buf):
         if len(buf) != PACKET_SIZE:
-            raise weewx.WeeWxIOError("Unexpected buffer length %d" % len(buf))
+            if len(buf) > PACKET_SIZE:
+                raise weewx.WeeWxIOError("Unexpected buffer length %d" % len(buf))
+            else:
+                raise weewx.WeeWxIOError("Unexpected buffer length %d %s" % (len(buf),buf))
         if buf[0:1] != 'c':
             raise weewx.WeeWxIOError("Unexpected header bytes '%s'" % buf[0:2])
 	if StationData.invalid_checksum(buf):
@@ -180,22 +213,64 @@ class StationData(object):
         return buf
 
     @staticmethod
-    # VERY hacky - needs refinement
     def parse_readings(raw):
+        if DEBUG_READ >= 2 or exists("/tmp/dfdebug"):
+            logdbg(str(raw))
         buf = raw
 	data = dict()
-        data['windDir'] = StationData._decode(buf[1:4])  # compass deg
-        data['windSpeed'] = StationData._decode(buf[5:8])*10 # mph
-        data['wind_average'] = StationData._decode(buf[9:12])*10  # mph
-	data['outTemp'] = StationData._decode(buf[13:16]) # Fahrenheit is expected from device
-        data['rain_total'] = StationData._decode(buf[17:20])/100  # inch
-        data['daily_rain'] = StationData._decode(buf[21:24])/100  # inch
-        data['outHumidity'] = StationData._decode(buf[25:27])  # percent
-        data['pressure'] = StationData._decode(buf[28:33])/10*INHG_PER_MBAR  # inHg 0.01554094892716838*
+        # section to sanity check pressure readings (high and prolonged humidty appears to upset pressure sensor)
+        try:
+            airPressure = StationData._decode(buf[28:33])/10*INHG_PER_MBAR  # inHg 0.01554094892716838*
+            if airPressure>24 and airPressure<32:
+                data['pressure'] = airPressure
+            else:
+                logerr("DFRobot pressure out of range: "+str(airPressure))
+        except:
+            logerr("Error decoding air pressure")
+
+        if LOW_RES_VANE: # Check if LOW_RES_VANE flag is set
+            try:
+                data['windDir'] = averageDir(StationData._decode(buf[1:4]))  # compass degrees smoothed
+            except:
+                logerr("Error decoding wind direction (average function)")
+        else:
+            try:
+                data['windDir'] = StationData._decode(buf[1:4])  # compass deg
+            except:
+                logerr("Error decoding wind direction")
+        try:
+            data['windSpeed'] = StationData._decode(buf[5:8])*1.2 # mph
+        except:
+            logerr("Error decoding wind speed")
+
+        try:
+            data['wind_average'] = StationData._decode(buf[9:12])*1.2  # mph
+        except:
+            logerr("Error decoding wind 5 minute average")
+
+        try:
+            data['outTemp'] = StationData._decode(buf[13:16])
+        except:
+            logerr("Error decoding outdoor temperature")
+
+        try:
+            data['rain_total'] = StationData._decode(buf[17:20])/100  # inch
+        except:
+            logerr("Error decoding total rainfall")
+
+        try:
+            data['daily_rain'] = StationData._decode(buf[21:24])/100  # inch
+        except:
+            logerr("Error decoding rain fall")
+
+        try:
+            data['outHumidity'] = StationData._decode(buf[25:27])  # percent
+        except:
+            logerr("Error decoding humidity")
+        #data['pressure'] = StationData._decode(buf[28:33])/10*INHG_PER_MBAR  # inHg 0.01554094892716838*
         return data
 
     @staticmethod
-    # Determine is checksum is INVALID
     def invalid_checksum(datagram=None):
         if datagram==None:
             return(True)
@@ -237,7 +312,7 @@ class StationData(object):
 class StationSerial(object):
     def __init__(self, port, timeout=3):
         self.port = port
-        self.baudrate = 9600
+        self.baudrate = 2400
         self.timeout = timeout
         self.serial_port = None
 
@@ -260,7 +335,7 @@ class StationSerial(object):
             self.serial_port.close()
             self.serial_port = None
 
-    # FIXME: use either CR or LF as line terminator.  apparently some dfrobot/WS1
+    # FIXME: use either CR or LF as line terminator.  apparently some dfrobot
     # hardware occasionally ends a line with only CR instead of the standard
     # CR-LF, resulting in a line that is too long.
     def get_readings(self):
@@ -290,7 +365,7 @@ class StationSerial(object):
 #          Station TCP class - Gets data through a TCP/IP connection          #
 #                  For those users with a serial->TCP adapter                 #
 # =========================================================================== #
-# Not used by DFRobot device - pruning candidate
+
 
 class StationSocket(object):
     def __init__(self, addr, protocol='tcp', timeout=3, max_tries=5,
