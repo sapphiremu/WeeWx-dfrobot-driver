@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Driver adapted by Saffron Murcia (2020) for
+# Driver adapted by Saffron Murcia 2020 for
 # DF Robot weather station kit with Anemometer/Wind Vane/Rain Bucket
 # All credit for original driver goes to Matthew Wall and other mentions below.
 
@@ -17,7 +17,9 @@
 # 0.03.2 - added try-except function around each packet section to increase robustness of driver. XOR
 #          checksum provided by driver will not detect transposed values.
 # 0.04 - (Linux) functionality added so if /tmp/dfdebug exists, log the packet received to syslog
-# 0.05 - Added function to smooth with direction data from low-res windvane. NONE-COMPLIANT OPTION. See documentation
+# 0.05 - Added function to smooth with direction data from low-res windvane. NONE-COMPLIANT OPTION. See WeeWX documentation
+# 0.06 - Added function to correct for altitude pressure difference
+
 
 """
 #
@@ -38,20 +40,37 @@ from __future__ import with_statement
 import syslog
 import time
 from os.path import exists
-from math import sin, cos, atan2
+from math import sin, cos, atan2, exp
 
 from weewx.units import INHG_PER_MBAR, MILE_PER_KM
 import weewx.drivers
 import weewx.wxformulas
 
 DRIVER_NAME = 'dfrobot'
-DRIVER_VERSION = '0.05'
+DRIVER_VERSION = '0.06'
+
+# Config
+HEIGHT_ABOVE_SEA_LEVEL = 730 # Metres above sea level
+LOW_RES_VANE = True # Set to True for 4 point vane
+
+# Function to deal with altitude pressure varience
+
+
+def airPressureDecrement(alt, tempC = 20):
+    REF_PRESSURE = 101325 # Reference pressure at sea level
+    REF_ALTITUDE = 0
+    # There should be no reason to alter G, M or R unless you use the driver on another planet..
+    G = 9.80665 # Metres per second squared 
+    M = 0.0289644 # Molar mass of air
+    R = 8.31432 # Universal gas constant
+    T = 273 + tempC # 20 C in kelvins
+    pressure = REF_PRESSURE * exp(-G * M * (alt - REF_ALTITUDE)/(R * T))
+    pressureReduction = (REF_PRESSURE - pressure)/100
+    return (pressureReduction)
 
 # Functions to deal with low-res windvane hardware.
 # This section goes against the WeeWX guidelines for
 # the functionality of a drive. Use with caution.
-
-LOW_RES_VANE = True # Set to True for 4 point vane
 
 direction=[]
 sampleSize = 30 #how many direction values to use as the sample
@@ -220,7 +239,7 @@ class StationData(object):
 	data = dict()
         # section to sanity check pressure readings (high and prolonged humidty appears to upset pressure sensor)
         try:
-            airPressure = StationData._decode(buf[28:33])/10*INHG_PER_MBAR  # inHg 0.01554094892716838*
+            airPressure = ((StationData._decode(buf[28:33])/10)+airPressureDecrement(HEIGHT_ABOVE_SEA_LEVEL))*INHG_PER_MBAR  # inHg 0.01554094892716838*
             if airPressure>24 and airPressure<32:
                 data['pressure'] = airPressure
             else:
@@ -267,7 +286,6 @@ class StationData(object):
             data['outHumidity'] = StationData._decode(buf[25:27])  # percent
         except:
             logerr("Error decoding humidity")
-        #data['pressure'] = StationData._decode(buf[28:33])/10*INHG_PER_MBAR  # inHg 0.01554094892716838*
         return data
 
     @staticmethod
